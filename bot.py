@@ -1,50 +1,33 @@
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-import json
+import telebot
 import os
+from flask import Flask
 
-TOKEN = "8641628383:AAHLmCry4lLS2MicMqfP5gC5QslyG1xWrPk"
-DATA_FILE = "database.json"
+# إعدادات البوت
+API_TOKEN = '8641628383:AAFpiPkh4GKkicpLgJsTaK-efKUKLfZKP64'
+ADMIN_ID = '8212079374'
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return []
+bot = telebot.TeleBot(API_TOKEN)
+app = Flask(__name__)
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+# أمر البداية
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "نظام أوميغا V300.0 جاهز للعمل. أهلاً بك يا محمد.")
 
-data = load_data()
+# الرد على الرسائل
+@bot.message_handler(func=lambda message: True)
+def echo_all(message):
+    bot.reply_to(message, "تم استلام رسالتك في نظام أوميغا.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 أهلاً بك\nارسل طلبك أو رسالتك وسيتم تسجيلها"
-    )
+# نقطة اتصال عشان ريندر ما يطفي البوت (Web Service)
+@app.route('/')
+def index():
+    return "Omega System is Running!"
 
-async def show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"📊 عدد الطلبات: {len(data)}")
-
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message.text
-    user = update.effective_user
-
-    data.append({
-        "user_id": user.id,
-        "name": user.first_name,
-        "message": msg
-    })
-
-    save_data(data)
-
-    await update.message.reply_text("✅ تم تسجيل طلبك")
-
-app = ApplicationBuilder().token(TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("show", show))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-
-print("Bot is running...")
-app.run_polling()
+if __name__ == "__main__":
+    # تشغيل البوت
+    import threading
+    threading.Thread(target=bot.infinity_polling).start()
+    # تشغيل السيرفر على المنفذ المطلوب
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
