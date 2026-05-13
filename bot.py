@@ -5,133 +5,109 @@ import os
 from flask import Flask
 import threading
 
-# --- الإعدادات (تأكد من الأيدي والتوكن) ---
+# --- الإعدادات (يفضل استخدام Environment Variables لاحقاً) ---
 API_TOKEN = '8641628383:AAFpiPkh4GKkicpLgJsTaK-efKUKLfZKP64'
 ADMIN_ID = 8212079374 
 
 bot = telebot.TeleBot(API_TOKEN)
 app = Flask(__name__)
 
-# --- وظائف قاعدة البيانات ---
-def get_db():
-    conn = sqlite3.connect('omega_enterprise.db', check_same_thread=False)
-    return conn
+# --- إدارة قاعدة البيانات (SQL Service) ---
+class DBService:
+    def __init__(self):
+        self.db_path = 'omega_v5.db'
+        self.init_db()
 
-def init_db():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS orders 
-                      (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, item TEXT, status TEXT, price REAL)''')
-    conn.commit()
-    conn.close()
+    def query(self, sql, params=(), commit=False, fetch=False):
+        # اتصال آمن لكل طلب لتجنب مشاكل الـ Threading
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            if commit: conn.commit()
+            if fetch: return cursor.fetchall()
+            return cursor.lastrowid
 
-init_db()
+    def init_db(self):
+        # جدول المستخدمين
+        self.query("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)", commit=True)
+        # جدول المنتجات (الديناميكي)
+        self.query("CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, name TEXT, price REAL)", commit=True)
+        # جدول الطلبات
+        self.query("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, prod_id INTEGER, status TEXT)", commit=True)
+        
+        # إضافة منتجات افتراضية إذا كانت القائمة فارغة
+        if not self.query("SELECT * FROM products", fetch=True):
+            self.query("INSERT INTO products (name, price) VALUES (?, ?)", ("اشتراك دعم شهري", 30.0), commit=True)
+            self.query("INSERT INTO products (name, price) VALUES (?, ?)", ("نظام أوميغا الكامل", 700.0), commit=True)
 
-# --- القوائم ---
-def admin_menu():
+db = DBService()
+
+# --- لوحات التحكم ---
+def get_main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add('📊 إحصائيات النظام', '📢 إعلان جماعي', '⚙️ الإعدادات')
+    markup.add('🛍️ تصفح المتجر', '📦 تتبع طلباتي', '📞 الدعم الفني')
     return markup
 
-def main_menu():
+def get_admin_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add('🛍️ المنتجات', '🛒 تتبع طلبي', '💳 شحن رصيد', '📞 الدعم الفني')
+    markup.add('📊 التقارير', '📢 إعلان جماعي', '🆕 إضافة منتج', '✅ إدارة الطلبات')
     return markup
 
-# --- الأوامر الرئيسية ---
+# --- المنطق البرمجي للبوت ---
 @bot.message_handler(commands=['start'])
-def start(message):
-    conn = get_db()
-    conn.execute('INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)', (message.from_user.id, message.from_user.first_name))
-    conn.commit()
-    conn.close()
-
+def handle_start(message):
+    db.query("INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)", (message.from_user.id, message.from_user.first_name), commit=True)
     if message.from_user.id == ADMIN_ID:
-        bot.send_message(message.chat.id, "🔱 أهلاً بك يا قائد أوميغا. كل الأنظمة تحت سيطرتك الآن.", reply_markup=admin_menu())
+        bot.send_message(message.chat.id, "🔱 نظام أوميغا: وضع القائد مفعل.", reply_markup=get_admin_menu())
     else:
-        bot.send_message(message.chat.id, "مرحباً بك في نظام أوميغا المتكامل 🚀", reply_markup=main_menu())
+        bot.send_message(message.chat.id, "مرحباً بك في أوميغا V5.0 🚀\nنظام التجارة المؤتمت الأول.", reply_markup=get_main_menu())
 
-# --- معالجة الرسائل والكبسات (المنطق الفعلي) ---
 @bot.message_handler(func=lambda m: True)
-def handle_logic(message):
+def router(message):
     uid = message.from_user.id
     text = message.text
 
-    # 1. قسم الإدارة (فقط لك)
+    # مسار الأدمن
     if uid == ADMIN_ID:
-        if text == '📊 إحصائيات النظام':
-            conn = get_db()
-            u_count = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-            o_count = conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0]
-            sales = conn.execute('SELECT SUM(price) FROM orders').fetchone()[0] or 0
-            conn.close()
-            msg = f"📈 **تقرير النظام الحلي:**\n\n👤 عدد المستخدمين: {u_count}\n📦 عدد الطلبات: {o_count}\n💰 إجمالي المبيعات: {sales}$"
-            bot.reply_to(message, msg, parse_mode="Markdown")
-        
-        elif text == '📢 إعلان جماعي':
-            bot.reply_to(message, "حاضر يا قائد، ارسل نص الإعلان الآن ليتم تعميمه:")
-            bot.register_next_step_handler(message, process_broadcast)
-            return
+        if text == '📊 التقارير':
+            u_count = len(db.query("SELECT id FROM users", fetch=True))
+            o_count = len(db.query("SELECT id FROM orders", fetch=True))
+            bot.reply_to(message, f"📈 إحصائيات حية:\n- مستخدمين: {u_count}\n- طلبات: {o_count}")
+        elif text == '✅ إدارة الطلبات':
+            pending = db.query("SELECT id, user_id FROM orders WHERE status='بانتظار الدفع' LIMIT 5", fetch=True)
+            for order in pending:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton(f"تأكيد دفع #{order[0]}", callback_data=f"confirm_{order[0]}"))
+                bot.send_message(ADMIN_ID, f"طلب معلق رقم #{order[0]} من {order[1]}", reply_markup=markup)
 
-    # 2. قسم المستخدمين
-    if text == '🛍️ المنتجات':
+    # مسار المستخدم
+    if text == '🛍️ تصفح المتجر':
+        prods = db.query("SELECT * FROM products", fetch=True)
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("📦 اشتراك شهري - 30$", callback_data="buy_30"))
-        markup.add(types.InlineKeyboardButton("🔥 نظام كامل - 700$", callback_data="buy_700"))
-        bot.send_message(message.chat.id, "اختر الخدمة التي تود طلبها:", reply_markup=markup)
+        for p in prods:
+            markup.add(types.InlineKeyboardButton(f"{p[1]} - {p[2]}$", callback_data=f"buy_{p[0]}"))
+        bot.send_message(message.chat.id, "قائمة المنتجات المتوفرة حالياً:", reply_markup=markup)
 
-    elif text == '🛒 تتبع طلبي':
-        conn = get_db()
-        order = conn.execute('SELECT id, item, status FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 1', (uid,)).fetchone()
-        conn.close()
-        if order:
-            bot.reply_to(message, f"🔍 **آخر طلب لك:**\n\nرقم الطلب: #{order[0]}\nالخدمة: {order[1]}\nالحالة: {order[2]}")
-        else:
-            bot.reply_to(message, "لا توجد طلبات مسجلة باسمك حالياً.")
-
-    elif text == '📞 الدعم الفني':
-        bot.reply_to(message, "اكتب مشكلتك الآن، وسيتم تحويلها للمدير فوراً.")
-
-    # تحويل أي كلام موجه للبوت كدعم فني للأدمن
-    elif uid != ADMIN_ID:
-        bot.send_message(ADMIN_ID, f"📩 **رسالة دعم جديدة:**\nمن: {message.from_user.first_name}\nالأيدي: `{uid}`\n\nالرسالة: {text}", parse_mode="Markdown")
-        bot.reply_to(message, "✅ تم إرسال رسالتك للمدير.")
-
-# --- وظائف مساعدة ---
-def process_broadcast(message):
-    conn = get_db()
-    users = conn.execute('SELECT id FROM users').fetchall()
-    conn.close()
-    count = 0
-    for u in users:
-        try:
-            bot.send_message(u[0], f"📢 **إعلان من الإدارة:**\n\n{message.text}", parse_mode="Markdown")
-            count += 1
-        except: pass
-    bot.send_message(ADMIN_ID, f"✅ تم إرسال الإعلان بنجاح إلى {count} مستخدم.")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('buy_'))
-def purchase_logic(call):
-    price = 30.0 if "30" in call.data else 700.0
-    item = "اشتراك شهري" if price == 30 else "نظام أوميغا الكامل"
+@bot.callback_query_handler(func=lambda call: True)
+def callbacks(call):
+    if call.data.startswith('buy_'):
+        pid = call.data.split('_')[1]
+        order_id = db.query("INSERT INTO orders (user_id, prod_id, status) VALUES (?, ?, ?)", (call.from_user.id, pid, 'بانتظار الدفع'), commit=True)
+        bot.answer_callback_query(call.id, "تم تسجيل الطلب!")
+        bot.edit_message_text(f"✅ تم إنشاء الطلب رقم #{order_id}.\nتواصل مع الإدارة للدفع.", call.message.chat.id, call.message.message_id)
+        bot.send_message(ADMIN_ID, f"🚨 طلب جديد رقم #{order_id}")
     
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('INSERT INTO orders (user_id, item, status, price) VALUES (?, ?, ?, ?)', 
-                   (call.from_user.id, item, 'بانتظار الدفع', price))
-    order_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    elif call.data.startswith('confirm_'):
+        oid = call.data.split('_')[1]
+        db.query("UPDATE orders SET status='تم الدفع' WHERE id=?", (oid,), commit=True)
+        bot.answer_callback_query(call.id, "تم تأكيد الدفع ✅")
+        bot.edit_message_text(f"الطلب #{oid} صار جاهز ومكتمل!", call.message.chat.id, call.message.message_id)
 
-    bot.edit_message_text(f"✅ تم تسجيل طلبك بنجاح!\n\nرقم الطلب: #{order_id}\nالخدمة: {item}\nالسعر: {price}$\n\nسيقوم المدير بالتواصل معك الآن.", call.message.chat.id, call.message.message_id)
-    bot.send_message(ADMIN_ID, f"🚨 **طلب شراء جديد!**\nالعميل: {call.from_user.first_name}\nالمنتج: {item}\nرقم الطلب: {order_id}")
-
-# --- تشغيل السيرفر والبوت ---
-@app.route('/')
-def home(): return "Omega Enterprise System is Active 🚀"
+# --- تشغيل النظام ---
+def run_bot():
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: bot.infinity_polling()).start()
+    threading.Thread(target=run_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
