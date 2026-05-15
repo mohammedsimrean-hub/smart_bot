@@ -1,3 +1,7 @@
 pyTelegramBotAPI
-Flask
+psycopg2-binary
+redis
+playwright
+flask
+
 
