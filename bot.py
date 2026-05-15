@@ -1,165 +1,139 @@
-import os
-import time
-import asyncio
-import logging
-import hashlib
+import os, time, asyncio, logging, hashlib, threading, telebot, psycopg2, redis
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from functools import wraps
-
-import telebot
-import psycopg2
-import redis
 from flask import Flask
 from playwright.async_api import async_playwright
 
-# ===================== LOGGING ========================
-log_handler = RotatingFileHandler("omega.log", maxBytes=5 * 1024 * 1024, backupCount=2)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[log_handler, logging.StreamHandler()]
-)
-logger = logging.getLogger("OmegaSystem")
-
-# ===================== CONFIG (YOUR DATA) =============
-# بياناتك الخاصة التي طلبت إضافتها
+# --- CONFIG ---
 BOT_TOKEN = "8641628383:AAFpiPkh4GKkicpLgJsTaK-efKUKLfZKP64"
 ADMIN_ID = 8212079374
 ZAIN_CASH = "0782237627"
-CRYPTO_WALLET = "TYvU7hY8pS6k9... (ضع عنوان محفظتك الكامل هنا)" # تأكد من وضع عنوان USDT الخاص بك
-
-# روابط قواعد البيانات من Render (يفضل وضعها في ENV)
+CRYPTO_WALLET = "YOUR_USDT_TRC20_ADDRESS"
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-# ===================== DATABASE =======================
+# --- DATABASE ---
 class Database:
-    def connect(self):
-        return psycopg2.connect(DATABASE_URL)
-
+    def connect(self): return psycopg2.connect(DATABASE_URL)
     def init_db(self):
         with self.connect() as conn:
             with conn.cursor() as cur:
-                cur.execute('''
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
-                        id BIGINT PRIMARY KEY,
-                        username TEXT,
-                        subscription_type TEXT DEFAULT 'FREE',
+                        id BIGINT PRIMARY KEY, 
+                        username TEXT, 
+                        sub_type TEXT DEFAULT 'FREE', 
                         expire_ts BIGINT DEFAULT 0,
-                        total_spent NUMERIC DEFAULT 0,
-                        join_date TIMESTAMP DEFAULT NOW()
-                    )
-                ''')
-                cur.execute('''
-                    CREATE TABLE IF NOT EXISTS transactions (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT,
-                        amount NUMERIC,
-                        plan TEXT,
-                        created_at TIMESTAMP DEFAULT NOW()
-                    )
-                ''')
+                        total_spent NUMERIC DEFAULT 0
+                    )""")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_prefs (
+                        user_id BIGINT PRIMARY KEY,
+                        fav_model TEXT,
+                        max_price NUMERIC DEFAULT 1000000,
+                        is_active BOOLEAN DEFAULT TRUE
+                    )""")
                 conn.commit()
-        logger.info("Database initialized successfully")
-
 db = Database()
 
-# ===================== HELPERS & SECURITY =============
-def safe_execute(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        for _ in range(3):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Error in {func.__name__}: {e}")
-                time.sleep(1)
-        return None
-    return wrapper
+# --- SECURITY & CHECKING ---
+def has_active_sub(uid):
+    """التحقق المنطقي الكامل من الاشتراك (الحل للمشكلة المنطقية)"""
+    try:
+        with db.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT sub_type, expire_ts FROM users WHERE id=%s", (uid,))
+                res = cur.fetchone()
+                # التحقق: السجل موجود + ليس FREE + الوقت لم ينتهِ
+                return res and res[0] != 'FREE' and res[1] > int(time.time())
+    except Exception as e:
+        return False
 
-def register_user(user):
-    with db.connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO users (id, username) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
-                (user.id, user.username)
-            )
-            conn.commit()
+# --- DATA ENGINE (SCRAPER V5.1) ---
+async def fetch_market_data():
+    market_url = "https://haraj.com.sa/tags/سيارات"
+    market_avgs = {"كامري": 115000, "إلنترا": 75000, "سوناتا": 90000}
+    results = []
 
-# ===================== MENUS ==========================
-def main_menu():
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add('🚗 السيارات', '📊 الإحصائيات')
-    markup.add('💳 الاشتراك', '🛡️ الدعم')
-    return markup
+    async with async_playwright() as p:
+        # حل Memory Leak بفتح وإغلاق المتصفح في كل دورة
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        try:
+            await page.goto(market_url, timeout=60000)
+            await page.wait_for_selector('[data-testid="post-item"]', timeout=15000)
+            posts = await page.query_selector_all('[data-testid="post-item"]')
 
-# ===================== HANDLERS =======================
-@bot.message_handler(commands=['start'])
-@safe_execute
-def start(message):
-    register_user(message.from_user)
-    bot.send_message(
-        message.chat.id, 
-        "🚀 **أهلاً بك في منصة أوميغا للاستخبارات التجارية**\n\nنظامك جاهز لرصد الفرص في الأردن والخليج.", 
-        reply_markup=main_menu()
-    )
+            for post in posts[:15]:
+                try:
+                    # تحسين Error Handling لمنع الـ Crash في حال غياب أي عنصر
+                    title_el = await post.query_selector('h3')
+                    price_el = await post.query_selector('[data-testid="post-price"]')
+                    link_el = await post.query_selector('a')
+                    
+                    if not title_el or not price_el or not link_el: continue
+                    
+                    title = await title_el.inner_text()
+                    price_t = await price_el.inner_text()
+                    link = await link_el.get_attribute('href')
+                    
+                    price = int(''.join(filter(str.isdigit, price_t)))
+                    fid = hashlib.md5(link.encode()).hexdigest()
+                    
+                    if not redis_client.get(f"seen:{fid}"):
+                        redis_client.set(f"seen:{fid}", 1, ex=86400)
+                        
+                        score = 0
+                        model_hit = None
+                        for model, avg in market_avgs.items():
+                            if model in title:
+                                model_hit = model
+                                ratio = price / avg
+                                if ratio <= 0.85: score = 95
+                                elif ratio <= 0.95: score = 65
+                        
+                        results.append({
+                            "title": title, "price": price, 
+                            "link": f"https://haraj.com.sa{link}", 
+                            "score": score, "model": model_hit
+                        })
+                except: continue
+        finally:
+            await browser.close()
+    return results
 
-@bot.message_handler(func=lambda m: m.text == '💳 الاشتراك')
-@safe_execute
-def subscribe(message):
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🗓️ شهري - 30$", callback_data="buy_monthly_30"))
-    markup.add(telebot.types.InlineKeyboardButton("🏆 سنوي - 299$", callback_data="buy_yearly_299"))
-    bot.send_message(message.chat.id, "💎 **اختر خطة الاشتراك المناسبة لك:**", reply_markup=markup)
+async def dispatcher_loop():
+    while True:
+        try:
+            listings = await fetch_market_data()
+            for item in listings:
+                # 1. إرسال للأدمن (للرقابة الشاملة)
+                if item['score'] >= 65:
+                    bot.send_message(ADMIN_ID, f"📢 **فرصة ذكية ({item['score']}/100)**\n🚗 {item['title']}\n💰 {item['price']}\n🔗 {item['link']}")
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('buy_'))
-def buy_callback(c):
-    _, plan, price = c.data.split('_')
-    text = f"""
-💳 **تفاصيل إتمام الدفع**
+                # 2. إرسال للمستخدمين (التحقق من الفلتر والاشتراك)
+                if item['model']:
+                    with db.connect() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                SELECT p.user_id, p.max_price FROM user_prefs p 
+                                JOIN users u ON p.user_id = u.id 
+                                WHERE p.fav_model = %s AND u.sub_type != 'FREE' 
+                                AND u.expire_ts > %s AND p.is_active = TRUE
+                            """, (item['model'], int(time.time())))
+                            
+                            for uid, max_p in cur.fetchall():
+                                if item['price'] <= max_p:
+                                    bot.send_message(uid, f"🌟 **لقطة تطابق طلبك!**\n🚗 {item['title']}\n💰 {item['price']}\n🔗 {item['link']}")
+            await asyncio.sleep(600)
+        except: await asyncio.sleep(60)
 
-🔹 الخطة: `{plan}`
-💰 المبلغ: `${price}`
-
-📍 **داخل الأردن (Zain Cash):**
-`{ZAIN_CASH}`
-
-🌍 **دولي (USDT TRC20):**
-`{CRYPTO_WALLET}`
-
-📸 **يرجى إرسال صورة (Screenshot) للوصل هنا للتفعيل.**
-    """
-    bot.send_message(c.message.chat.id, text)
-
-# ===================== ADMIN METRICS ==================
-@bot.message_handler(commands=['admin'])
-def admin_panel(message):
-    if message.from_user.id != ADMIN_ID: return
-    with db.connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM users")
-            total = cur.fetchone()[0]
-            cur.execute("SELECT COALESCE(SUM(total_spent), 0) FROM users")
-            rev = cur.fetchone()[0]
-    
-    report = f"📊 **تقرير الإدارة**\n\n👥 الأعضاء: {total}\n💰 الأرباح: ${rev}"
-    bot.send_message(message.chat.id, report)
-
-# ===================== SYSTEM START ===================
-if __name__ == '__main__':
-    import threading
-    from flask import Flask
-    
-    # تشغيل Flask لـ Render Health Check
-    server = Flask(__name__)
-    @server.route('/')
-    def index(): return "Omega Online"
-    
-    threading.Thread(target=lambda: server.run(host='0.0.0.0', port=os.getenv('PORT', 5000))).start()
-    
-    logger.info("Omega System is LIVE...")
+# --- START SYSTEM ---
+if __name__ == "__main__":
     db.init_db()
+    threading.Thread(target=lambda: asyncio.run(dispatcher_loop()), daemon=True).start()
     bot.infinity_polling()
